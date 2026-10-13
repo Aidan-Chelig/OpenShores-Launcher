@@ -2,18 +2,16 @@
 
 ![OpenShores space banner](assets/figma/space-banner.png)
 
-A fast, portable Windows and Linux launcher for [OpenShores](https://openshores.net/), built with Tauri. It downloads the official game client, applies the latest compatible [OpenShores IP Patch](https://github.com/Celarious/OpenShores-IP-Patch), launches the game, and manages updates and uninstallation from a compact native interface.
+A fast, portable Windows and Linux launcher for [OpenShores](https://openshores.net/), built with Tauri. It downloads and applies the official OpenShores release archives, launches the game, and manages updates and uninstallation from a compact native interface.
 
 ## Features
 
-- Downloads the official OpenShores client from its per-file manifest and verifies every clean source file with SHA-256.
-- Reuses unchanged clean files during game refreshes and downloads only missing or changed files.
-- Fetches release ZIPs for the IP patch, preserves their folder structure, and applies every compatible xdelta with xdelta3.
-- Lets users follow the latest IP patch release or pin a specific published release.
-- Checks the selected IP patch in the background at startup and once per hour, without downloading the game again.
+- Uses the authenticated OpenShores website session to download protected game archives.
+- Verifies the official 2018 client, base patch, and incremental update with SHA-256.
+- Builds OpenShores in a staging directory and only replaces the active installation after every patch succeeds.
 - Launches the game and keeps the installed state after the game exits.
 - Refreshes or removes the launcher-managed game installation.
-- Checks IP patch and launcher update channels independently.
+- Checks game and launcher updates independently.
 - Updates the portable launcher executable in place—no installer required.
 - Stores settings and working data under:
     - Windows: `%LOCALAPPDATA%\OpenShores-Launcher`
@@ -147,11 +145,10 @@ Do not commit `src-tauri/target`, `src-tauri/gen`, `dist`, or `node_modules`; th
 
 ## Downloads, updates, and licensing
 
-- Game client manifest: [openshores.net/downloads/manifest.json](https://openshores.net/downloads/manifest.json)
-- IP patch releases: [Celarious/OpenShores-IP-Patch](https://github.com/Celarious/OpenShores-IP-Patch)
+- Game downloads: [openshores.net](https://openshores.net/)
 - Launcher updates: releases from `Norway174/OpenShores-Launcher`
 
-Binary patch application uses the embedded xdelta3 3.0.11 executable on Windows. xdelta3 is distributed under GPLv2, and its license is included at `resources/xdelta3/COPYING`. On Linux, the system is expected to have `xdelta3` available in the path.
+The official patch archives currently include `hpatchz.exe`. Windows runs it directly; Linux runs it through Wine. A native `patch.sh` supplied by the OpenShores release can replace the Wine patching step in a future update.
 
 ## Disclaimer
 

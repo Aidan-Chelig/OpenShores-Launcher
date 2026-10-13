@@ -41,12 +41,22 @@ use std::os::unix::process::CommandExt;
 #[cfg(target_os = "linux")]
 use std::os::unix::fs::PermissionsExt;
 
+const DOWNLOAD_BASE_URL: &str = "https://openshores.net/download/file/";
+// Kept while migrating existing managed installs away from the retired manifest format.
 const GAME_MANIFEST_URL: &str = "https://openshores.net/downloads/manifest.json";
+const BASE_CLIENT_ARCHIVE: &str = "Hazeron-2018-client.7z";
+const BASE_CLIENT_SHA256: &str = "013dd742a1af91da17afe7a42f88b896b06fd4a43a1c94e817c972bd85011c5c";
+const OPENSHORES_PATCH_ARCHIVE: &str = "OpenShores-patch.7z";
+const OPENSHORES_PATCH_SHA256: &str = "0c539701df99072dc8f724646923458f6d32bf25bda2c4b79e158f917dcf5efc";
+const GAME_UPDATE_ARCHIVE: &str = "OpenShores-1.0.0-to-1.0.2.zip";
+const GAME_UPDATE_SHA256: &str = "0e1ad291e8879303cb71c3d571610ee99b80929d2c405019545e53db11ac6bf4";
+const GAME_VERSION: &str = "1.0.2";
+const BASE_GAME_EXE: &str = "Shores of Hazeron.exe";
 const PATCH_RELEASE_API: &str =
     "https://api.github.com/repos/Celarious/OpenShores-IP-Patch/releases?per_page=100";
 const LAUNCHER_RELEASE_API: &str =
     "https://api.github.com/repos/Norway174/OpenShores-Launcher/releases?per_page=100";
-const GAME_EXE: &str = "Shores of Hazeron.exe";
+const GAME_EXE: &str = "OpenShores.exe";
 const GAME_DLL: &str = "AuLoginClient13.dll";
 const CLIENT_LOG: &str = "ClientInterface.log";
 const LOG_READ_CHUNK_SIZE: u64 = 1024 * 1024;
@@ -963,6 +973,26 @@ fn server_api_url(host: &str, endpoint: &str) -> LauncherResult<Url> {
     Url::parse(&format!("https://{}/api/{endpoint}", account_domain(host))).map_err(error_string)
 }
 
+fn csrf_token_from_html(html: &str) -> Option<&str> {
+    let marker = "<meta name=\"csrf-token\" content=\"";
+    let value = html.split_once(marker)?.1;
+    value.split_once('"').map(|(token, _)| token).filter(|token| !token.is_empty())
+}
+
+fn prepare_account_csrf(client: &Client, host: &str) -> LauncherResult<(String, String)> {
+    let origin = format!("https://{}", account_domain(host));
+    let response = client
+        .get(format!("{origin}/"))
+        .header("Cache-Control", "no-store")
+        .send()
+        .map_err(|_| "Could not reach the OpenShores website.".to_string())?;
+    let response = checked_response(response, "OpenShores website request")?;
+    let html = response.text().map_err(error_string)?;
+    let token = csrf_token_from_html(&html)
+        .ok_or_else(|| "The OpenShores website did not provide a CSRF token.".to_string())?;
+    Ok((origin, token.to_string()))
+}
+
 fn password_sha1_hex(password: &str) -> String {
     Sha1::digest(password.as_bytes())
         .iter()
@@ -1240,7 +1270,7 @@ fn validate_game_manifest(manifest: &GameManifest) -> LauncherResult<()> {
     if total_size != manifest.total_size {
         return Err("The game manifest total size does not match its file entries.".to_string());
     }
-    for required in [GAME_EXE, GAME_DLL] {
+    for required in [BASE_GAME_EXE, GAME_DLL] {
         if !manifest
             .files
             .iter()
@@ -1493,6 +1523,22 @@ fn verify_launcher_digest(path: &Path, asset: &GithubAsset) -> LauncherResult<()
     verify_asset_digest(path, asset)
 }
 
+fn verify_download_digest(path: &Path, name: &str, expected: &str) -> LauncherResult<()> {
+    let actual = sha256_file(path)?;
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Checksum verification failed for {name} (expected {expected}, received {actual})."
+        ))
+    }
+}
+
+fn extract_7z(archive: &Path, destination: &Path) -> LauncherResult<()> {
+    fs::create_dir_all(destination).map_err(error_string)?;
+    sevenz_rust2::decompress_file(archive, destination).map_err(error_string)
+}
+
 fn extract_zip(zip_path: &Path, destination: &Path) -> LauncherResult<()> {
     let input = File::open(zip_path).map_err(error_string)?;
     let mut archive = zip::ZipArchive::new(input).map_err(error_string)?;
@@ -1513,6 +1559,57 @@ fn extract_zip(zip_path: &Path, destination: &Path) -> LauncherResult<()> {
         }
     }
     Ok(())
+}
+
+fn apply_hpatch(patch_root: &Path, source: &Path, destination: &Path) -> LauncherResult<()> {
+    let patcher = patch_root.join("hpatchz.exe");
+    let patch = patch_root.join("openshores.patch");
+    if !patcher.is_file() || !patch.is_file() {
+        return Err("The OpenShores patch archive is missing hpatchz.exe or openshores.patch.".to_string());
+    }
+    if destination.exists() {
+        fs::remove_dir_all(destination).map_err(error_string)?;
+    }
+
+    #[cfg(windows)]
+    let mut command = Command::new(&patcher);
+    #[cfg(target_os = "linux")]
+    let mut command = {
+        let wine = which(WINE_NAME)
+            .map_err(|_| "Wine is required to run the OpenShores patcher on Linux.".to_string())?;
+        let mut command = Command::new(wine);
+        command.arg(&patcher);
+        command
+    };
+    command.arg("-f").arg(source).arg(&patch).arg(destination);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let output = command.output().map_err(error_string)?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let _ = fs::remove_dir_all(destination);
+        Err(format!(
+            "The OpenShores patcher exited with {}{}",
+            output.status,
+            if detail.is_empty() { String::new() } else { format!(": {detail}") }
+        ))
+    }
+}
+
+fn authenticated_download_client(state: &AppState, config: &LauncherConfig) -> LauncherResult<Client> {
+    let server_id = config
+        .connected_server_id
+        .as_deref()
+        .ok_or_else(|| "Connect to OpenShores and log in before installing the game.".to_string())?;
+    state
+        .account_clients
+        .lock()
+        .map_err(error_string)?
+        .get(server_id)
+        .cloned()
+        .ok_or_else(|| "Log in to the OpenShores website account again before downloading the game.".to_string())
 }
 
 #[cfg(windows)]
@@ -1901,92 +1998,11 @@ fn update_manifest_patch(game_root: &Path, release: &GithubRelease) -> LauncherR
 }
 
 fn update_ip_patch_sync(
-    app: &AppHandle,
+    _app: &AppHandle,
     state: &AppState,
-    force: bool,
+    _force: bool,
 ) -> LauncherResult<LauncherSnapshot> {
-    if any_game_process_running(state)? {
-        return Err("Close OpenShores before updating the IP patch.".to_string());
-    }
-    let config = load_config()?;
-    let install_path = PathBuf::from(config.install_path.clone().unwrap());
-    if !is_managed_manifest(read_json::<Value>(&install_path.join(MANIFEST_FILE)).as_ref()) {
-        return get_snapshot(state);
-    }
-    if config
-        .ip_patch_release
-        .eq_ignore_ascii_case(DISABLED_PATCH_RELEASE)
-    {
-        return install_game_sync(app, state, install_path);
-    }
-    let guard = begin_operation(state)?;
-    if any_game_process_running(state)? {
-        return Err("Close OpenShores before updating the IP patch.".to_string());
-    }
-    emit_operation_status(app, true, None);
-    emit_progress(
-        app,
-        "Checking the IP patch",
-        1.0,
-        "Contacting GitHub for the selected release...",
-    );
-    let mut work = None;
-    let result = (|| {
-        let client = http_client()?;
-        let releases = fetch_patch_releases(&client)?;
-        let release = resolve_patch_release(&releases, &config.ip_patch_release)?;
-        if !force && config.applied_ip_patch_release.as_deref() == Some(&release.tag_name) {
-            emit_progress(
-                app,
-                "IP patch is up to date",
-                100.0,
-                format!("{} is already installed.", release.tag_name),
-            );
-            return get_snapshot(state);
-        }
-        emit_progress(
-            app,
-            "Checking the IP patch",
-            3.0,
-            format!("Selected release: {}", release.tag_name),
-        );
-        let patch_work = launcher_temp_path()?.join(format!("ip-patch-{}", unique_token()));
-        work = Some(patch_work.clone());
-        download_and_apply_patch(
-            app,
-            &client,
-            &release,
-            &install_path,
-            &patch_work,
-            5.0,
-            75.0,
-        )?;
-        update_manifest_patch(&install_path, &release)?;
-        save_applied_patch_release(Some(&release.tag_name))?;
-        emit_progress(
-            app,
-            "IP patch is up to date",
-            100.0,
-            format!("{} is installed.", release.tag_name),
-        );
-        get_snapshot(state)
-    })();
-    if let Some(work) = work {
-        let _ = fs::remove_dir_all(work);
-    }
-    drop(guard);
-    match result {
-        Ok(mut snapshot) => {
-            snapshot.busy = false;
-            emit_operation_status(app, false, None);
-            let _ = app.emit("state-changed", snapshot.clone());
-            Ok(snapshot)
-        }
-        Err(error) => {
-            emit_operation_status(app, false, Some(error.clone()));
-            Err(error)
-        }
-    }
+    get_snapshot(state)
 }
 
 fn install_game_sync(
@@ -2013,74 +2029,68 @@ fn install_game_sync(
     let token = unique_token();
     let work = parent.join(format!(".openshores-staging-{token}"));
     let game_root = work.join("game");
-    let patch_path = work.join("patch");
     let backup_path = parent.join(format!(".openshores-backup-{token}"));
     let mut backup_active = false;
 
     let result = (|| {
         fs::create_dir_all(&game_root).map_err(error_string)?;
-        let client = http_client()?;
+        let config = load_config()?;
+        let client = authenticated_download_client(state, &config)?;
+        let base_archive = work.join(BASE_CLIENT_ARCHIVE);
+        let base_extract = work.join("base-client");
+        let official_patch_archive = work.join(OPENSHORES_PATCH_ARCHIVE);
+        let official_patch_extract = work.join("official-patch");
+        let update_archive = work.join(GAME_UPDATE_ARCHIVE);
+        let update_extract = work.join("game-update");
+        let version_100 = work.join("OpenShores-1.0.0");
 
-        emit_progress(
-            app,
-            "Getting the game manifest",
-            1.0,
-            "Connecting to openshores.net...",
-        );
-        let game_manifest = fetch_game_manifest(&client)?;
-        let (reused, downloaded) =
-            stage_game_from_manifest(app, &client, &game_manifest, &install_path, &game_root)?;
-        emit_progress(
-            app,
-            "Clean game files ready",
-            69.0,
-            format!("Reused {reused} files and downloaded {downloaded} files."),
-        );
-        let exe_path = game_root.join(GAME_EXE);
-        let dll_path = game_root.join(GAME_DLL);
-        if !exe_path.is_file() || !dll_path.is_file() {
-            return Err("The OpenShores manifest is missing required game files.".to_string());
+        for (name, checksum, destination, phase, start, end) in [
+            (BASE_CLIENT_ARCHIVE, BASE_CLIENT_SHA256, &base_archive, "Downloading the 2018 client", 1.0, 45.0),
+            (OPENSHORES_PATCH_ARCHIVE, OPENSHORES_PATCH_SHA256, &official_patch_archive, "Downloading the OpenShores patch", 45.0, 65.0),
+            (GAME_UPDATE_ARCHIVE, GAME_UPDATE_SHA256, &update_archive, "Downloading the game update", 65.0, 68.0),
+        ] {
+            let url = format!("{DOWNLOAD_BASE_URL}{name}");
+            download(app, &client, &url, destination, phase, start, end)?;
+            verify_download_digest(destination, name, checksum)?;
         }
 
-        let selection = load_config()?.ip_patch_release;
-        let release = if selection.eq_ignore_ascii_case(DISABLED_PATCH_RELEASE) {
-            emit_progress(
-                app,
-                "IP patch disabled",
-                84.0,
-                "Installing clean game files without the IP patch.",
-            );
-            None
-        } else {
-            emit_progress(
-                app,
-                "Getting the IP patch",
-                71.0,
-                "Checking the selected patch release...",
-            );
-            let releases = fetch_patch_releases(&client)?;
-            let release = resolve_patch_release(&releases, &selection)?;
-            download_and_apply_patch(app, &client, &release, &game_root, &patch_path, 72.0, 84.0)?;
-            Some(release)
-        };
+        emit_progress(app, "Unpacking the 2018 client", 69.0, "Extracting the base archive...");
+        extract_7z(&base_archive, &base_extract)?;
+        let base_client = base_extract.join("Shores of Hazeron");
+        if !base_client.join(BASE_GAME_EXE).is_file() {
+            return Err("The 2018 client archive has an unexpected folder layout.".to_string());
+        }
+
+        emit_progress(app, "Unpacking the OpenShores patch", 73.0, "Extracting patch files...");
+        extract_7z(&official_patch_archive, &official_patch_extract)?;
+        emit_progress(app, "Creating OpenShores 1.0.0", 77.0, "Applying the base patch...");
+        apply_hpatch(&official_patch_extract, &base_client, &version_100)?;
+
+        emit_progress(app, "Unpacking the game update", 88.0, "Extracting the 1.0.2 patch...");
+        fs::create_dir_all(&update_extract).map_err(error_string)?;
+        extract_zip(&update_archive, &update_extract)?;
+        emit_progress(app, "Updating OpenShores", 90.0, "Applying version 1.0.2...");
+        apply_hpatch(&update_extract, &version_100, &game_root)?;
+
+        if !game_root.join(GAME_EXE).is_file() {
+            return Err("The patched OpenShores installation is missing OpenShores.exe.".to_string());
+        }
 
         let installed_at = OffsetDateTime::now_utc()
             .format(&Rfc3339)
             .map_err(error_string)?;
-        let mut launcher_manifest = json!({
+        let launcher_manifest = json!({
             "managedBy": MANAGED_BY,
             "launcherVersion": env!("OPENSHORES_LAUNCHER_VERSION"),
             "installedAt": installed_at,
-            "gameManifestUrl": GAME_MANIFEST_URL,
-            "gameManifestVersion": game_manifest.version,
-            "gameManifestGenerated": game_manifest.generated,
-            "gameManifestFileCount": game_manifest.files.len()
+            "gameVersion": GAME_VERSION,
+            "baseArchive": BASE_CLIENT_ARCHIVE,
+            "baseArchiveSha256": BASE_CLIENT_SHA256,
+            "patchArchive": OPENSHORES_PATCH_ARCHIVE,
+            "patchArchiveSha256": OPENSHORES_PATCH_SHA256,
+            "updateArchive": GAME_UPDATE_ARCHIVE,
+            "updateArchiveSha256": GAME_UPDATE_SHA256
         });
-        if let Some(release) = release.as_ref() {
-            let object = launcher_manifest.as_object_mut().unwrap();
-            object.insert("patchTag".to_string(), json!(release.tag_name));
-            object.insert("patchPublishedAt".to_string(), json!(release.published_at));
-        }
         write_json(&game_root.join(MANIFEST_FILE), &launcher_manifest)?;
         emit_progress(
             app,
@@ -2098,16 +2108,12 @@ fn install_game_sync(
             backup_active = false;
         }
         save_install_path(&install_path)?;
-        save_applied_patch_release(release.as_ref().map(|release| release.tag_name.as_str()))?;
+        save_applied_patch_release(None)?;
         emit_progress(
             app,
             "Ready to play",
             100.0,
-            if release.is_some() {
-                "OpenShores and the IP patch are installed."
-            } else {
-                "OpenShores is installed without the IP patch."
-            },
+            format!("OpenShores {GAME_VERSION} is installed."),
         );
         get_snapshot(state)
     })();
@@ -2398,43 +2404,10 @@ fn check_updates_sync(
 }
 
 fn check_ip_patch_update_sync() -> LauncherResult<UpdaterStatusPayload> {
-    let config = load_config()?;
-    let install_path = PathBuf::from(config.install_path.clone().unwrap());
-    if !is_managed_manifest(read_json::<Value>(&install_path.join(MANIFEST_FILE)).as_ref()) {
-        return Ok(updater_status("current", "Install OpenShores before checking the IP patch."));
-    }
-
-    if config
-        .ip_patch_release
-        .eq_ignore_ascii_case(DISABLED_PATCH_RELEASE)
-    {
-        return Ok(if config.applied_ip_patch_release.is_some() {
-            updater_status("available", "The installed IP patch can be removed.")
-        } else {
-            updater_status("current", "The IP patch is disabled.")
-        });
-    }
-
-    let client = http_client()?;
-    let releases = fetch_patch_releases(&client)?;
-    let release = resolve_patch_release(&releases, &config.ip_patch_release)?;
-    if config.applied_ip_patch_release.as_deref() == Some(&release.tag_name) {
-        return Ok(updater_status("current", format!("IP patch {} is up to date.", release.tag_name)));
-    }
-
-    let prior_tag = config.applied_ip_patch_release.as_deref();
-    let target_index = releases
-        .iter()
-        .position(|candidate| candidate.tag_name == release.tag_name)
-        .unwrap_or(0);
-    let included_releases = releases[target_index..]
-        .iter()
-        .take_while(|candidate| Some(candidate.tag_name.as_str()) != prior_tag);
-    let mut status = updater_status("available", format!("IP patch {} is available.", release.tag_name));
-    status.changelog_title = Some(format!("IP patch {}", release.tag_name));
-    status.changelog = Some(release_changelog(included_releases));
-    status.release_url = Some(release.html_url.clone());
-    Ok(status)
+    Ok(updater_status(
+        "current",
+        "The server patch is included in official OpenShores releases.",
+    ))
 }
 
 fn game_manifest_update_available(local: Option<&Value>, remote: &GameManifest) -> bool {
@@ -2455,11 +2428,14 @@ fn check_game_update_sync() -> LauncherResult<UpdaterStatusPayload> {
         return Ok(updater_status("current", "Install OpenShores before checking game files."));
     }
 
-    let remote = fetch_game_manifest(&http_client()?)?;
-    if game_manifest_update_available(local.as_ref(), &remote) {
-        Ok(updater_status("available", format!("OpenShores client {} is available.", remote.version)))
+    let installed_version = local
+        .as_ref()
+        .and_then(|manifest| manifest.get("gameVersion"))
+        .and_then(Value::as_str);
+    if installed_version != Some(GAME_VERSION) {
+        Ok(updater_status("available", format!("OpenShores client {GAME_VERSION} is available.")))
     } else {
-        Ok(updater_status("current", "OpenShores game files are up to date."))
+        Ok(updater_status("current", format!("OpenShores {GAME_VERSION} is up to date.")))
     }
 }
 
@@ -3565,8 +3541,12 @@ fn authenticate_account(
     let mut config = load_config()?;
     let server = connected_server(&config)?;
     let client = account_client()?;
+    let (origin, csrf_token) = prepare_account_csrf(&client, &server.host)?;
     let response = client
         .post(server_api_url(&server.host, endpoint)?)
+        .header("X-CSRFToken", csrf_token)
+        .header("Origin", &origin)
+        .header("Referer", format!("{origin}/"))
         .json(&json!({ "username": username.trim(), "password": password }))
         .send()
         .map_err(|_| "Could not reach the account server.".to_string())?;
@@ -4074,7 +4054,7 @@ mod tests {
             total_size: 30,
             files: vec![
                 GameManifestFile {
-                    path: GAME_EXE.to_string(),
+                    path: BASE_GAME_EXE.to_string(),
                     size: 20,
                     sha256: "a".repeat(64),
                 },
@@ -4341,6 +4321,13 @@ mod tests {
     }
 
     #[test]
+    fn csrf_token_is_read_from_the_website_meta_tag() {
+        let html = r#"<head><meta name="csrf-token" content="test-token-123"></head>"#;
+        assert_eq!(csrf_token_from_html(html), Some("test-token-123"));
+        assert_eq!(csrf_token_from_html("<head></head>"), None);
+    }
+
+    #[test]
     fn hazeron_password_uses_raw_sha1_bytes_in_qt_byte_array_format() {
         let stored_hash = password_sha1_hex("password");
         assert_eq!(stored_hash, "5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8");
@@ -4464,7 +4451,7 @@ mod tests {
     #[test]
     fn game_manifest_rejects_duplicate_paths_and_wrong_totals() {
         let mut duplicate = test_game_manifest();
-        duplicate.files[1].path = GAME_EXE.to_ascii_lowercase();
+        duplicate.files[1].path = BASE_GAME_EXE.to_ascii_lowercase();
         assert!(validate_game_manifest(&duplicate)
             .unwrap_err()
             .contains("duplicate"));
